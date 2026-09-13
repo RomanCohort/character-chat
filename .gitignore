@@ -16,3 +16,34 @@ data/
 civis_model.pt
 personality_state.json
 emotion_state.json
+
+# --- 运行产物、临时文件、本地运维脚本（2026-09-13 加）---
+# 理由：这个仓库是 public。日志里有对话内容和本机用户名，
+# 临时 txt/json 是调试输出，_gen_*.ps1 是一次性脚本，都不该进去。
+*.log
+*.out
+logs/
+_igem_tmp/
+_quarantine_junk/
+_gen_*.ps1
+_gen_*.bat
+
+# 本地运维 / 一次性脚本（路径写死本机，对别人没用）
+_bridge_watchdog.ps1
+_deepclaw_restart.ps1
+_lan_bind_patch.yml
+_probe_settings.mjs
+_probe_*.py
+_report_*.txt
+
+# 调试输出
+test_env*.txt
+test_rhythm*.txt
+test_*_reply.json
+tsun_reply.json
+dsh_memo_number.txt
+server*.log
+
+# 个人笔记（非代码）
+iGEM_Best_Software_*.txt
+夸夸吉大计院.txt

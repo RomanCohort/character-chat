@@ -1,0 +1,58 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+#
+# The Claude Code grafts (skills root, hooks bridge, MCP servers) live in the
+# machine-level layer at ~/.dsh/cordis.patch.yml so every profile gets them.
+#
+# 放在 ~/.dsh/profiles/web/cordis.patch.yml。
+
+# dsh-approval-gate: the auto-approve permission preset. A patch replaces the
+# targeted row's whole config, so the three shipped presets are restated here
+# alongside the new auto-approve entry.
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+      auto-approve:
+        sandbox: workspace-write
+        approval: ask
+        name: 自动审批（Flash）
+        description: 多级判定：工作区写入自动放行，危险操作转人工审批。
+
+# Claude Code 钩子桥接。跑 ~/.dsh/hooks.json 里的 UserPromptSubmit 钩子：
+# persona-context.mjs 把当前人设作为 additionalContext 每轮重新注入，让它落在
+# 上下文末尾（和 Claude Code 一样），而不是 system prompt 开头一次性的 prefix。
+# 当前人设由 ~/.dsh/persona/active.txt 指定，缺省 milivia.md。
+#
+# 注意：这是进程级、对所有 session 生效的（hook payload 里没有 preset 信息）。
+# 想按 preset 精确作用域，得写一个挂在 preset 上的原生插件。
+- insert:
+    - id: hooks-claude-code
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        # 把 <YOU> 换成你的用户名，或用 %USERPROFILE% / $HOME。
+        # 原来这里写死了一个绝对路径，换机器就静默不生效。
+        configPath: ~/.dsh/hooks.json
+
+# --- remote-web-ui lan-bind block (managed - do not edit) ---
+# 注意：host 0.0.0.0 = 局域网内任何设备都能访问这个 GUI。
+# 方便手机连，但同一网络下别人也能打开——不需要就删掉这段，让它回到 127.0.0.1。
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: '0.0.0.0'
+    port: 3080
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+# --- end remote-web-ui lan-bind block ---

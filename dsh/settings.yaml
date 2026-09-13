@@ -1,0 +1,18 @@
+permission:
+  defaultPreset: danger-full-access
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-flash
+  reasoningEffort: max
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+agent-presets:
+  default: milivia
+ui-theme:
+  preference: dark
+pet:
+  visible: false
+  size: 160
+  right: 110
+  bottom: 505
+  petId: whale-girl

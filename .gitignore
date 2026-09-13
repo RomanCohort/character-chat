@@ -47,3 +47,11 @@ server*.log
 # 个人笔记（非代码）
 iGEM_Best_Software_*.txt
 夸夸吉大计院.txt
+
+# --- 凭据（2026-09-13 加）---
+# dsh/.credentials.yaml 里是明文 API key。只提交 .credentials.example.yaml。
+# 已经泄露过的东西删文件没用，要吊销重发——进了 git 历史就清不干净。
+.credentials.yaml
+dsh/.credentials.yaml
+*.credentials.yaml
+!*.credentials.example.yaml

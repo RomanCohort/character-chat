@@ -17,14 +17,77 @@ from character_chat.scene.state import SceneState, SceneManager, SceneObject
 from character_chat.scene.parser import parse_scene_tag
 
 
+# ---------------------------------------------------------------------------
+# 时间冻结工具（2026-09-12 加）
+#
+# WorldClock 从"叙事虚构时间"重写成了"真实墙钟"：day/minute/phase 不再是构造
+# 参数，而是从 datetime.now() / date.today() 算出来的只读属性。所以测试不能再
+# "构造一个 17:00 的时钟"，必须把系统时间钉住。
+#
+# 只补丁 clock 模块里引用的 datetime / date 两个名字，不动全局，别的测试不受影响。
+# ---------------------------------------------------------------------------
+import datetime as _dt
+
+
+class _FrozenDateTime(_dt.datetime):
+    _now = None
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._now
+
+
+class _FrozenDate(_dt.date):
+    @classmethod
+    def today(cls):
+        # 从冻结的"现在"推导，这样 set_now() 推进会同时带动 date.today()。
+        # （第一版写成静态快照，结果 set_now 之后 date.today() 还答旧日期，
+        #   day 属性永远算成 1——跨天测试因此假失败。）
+        return _FrozenDateTime._now.date()
+
+
+def _freeze(monkeypatch, moment: _dt.datetime, first_date: _dt.date | None = None):
+    """把 character_chat.world.clock 看到的时间钉在 `moment`。
+
+    first_date 是"第一次互动"的锚点（决定 day 从哪天算起）；不传时由 moment 推导。
+
+    返回一个 setter：调用它就能把时间推到新的一刻，用来测 phase/day 变化。
+    """
+    from character_chat.world import clock as clock_mod
+
+    _FrozenDateTime._now = moment
+    if first_date is not None:
+        _FrozenDate._today = first_date   # 显式锚点（默认走 today() 推导）
+    monkeypatch.setattr(clock_mod, "datetime", _FrozenDateTime, raising=False)
+    monkeypatch.setattr(clock_mod, "date", _FrozenDate, raising=False)
+
+    def set_now(new_moment: _dt.datetime):
+        _FrozenDateTime._now = new_moment
+
+    return set_now
+
+
+def _clock_at(monkeypatch, moment: _dt.datetime, **kw):
+    """钉住时间并造一个 WorldClock。**必须用 tmp_path 当 data_dir**。
+
+    不传 data_dir 时 clock.py 会退到 Path("data")，也就是往工作目录里
+    写 first_interaction.json —— 测试不该有这种副作用。
+    """
+    data_dir = kw.pop("data_dir", None)
+    if data_dir is None:
+        raise ValueError("_clock_at 必须给 data_dir=tmp_path（否则会往工作目录写文件）")
+    _freeze(monkeypatch, moment)
+    return WorldClock(data_dir=data_dir)
+
+
 class TestWorldClock:
     """Test narrative time clock."""
 
-    def test_initial_state(self):
-        """Clock starts at given time."""
-        clock = WorldClock(day=1, minute=1020)  # 17:00
-        assert clock.day == 1
-        assert clock.minute == 1020
+    def test_initial_state(self, monkeypatch, tmp_path):
+        """Clock reads the pinned wall-clock time."""
+        clock = _clock_at(monkeypatch, _dt.datetime(2026, 9, 12, 17, 0), data_dir=tmp_path)
+        assert clock.day == 1          # 锚点默认=今天 → 第 1 天
+        assert clock.minute == 1020    # 17:00
         assert clock.phase == "黄昏"
         assert clock.hhmm == "17:00"
 
@@ -44,40 +107,95 @@ class TestWorldClock:
         assert minute_to_hhmm(1020) == "17:00"
         assert minute_to_hhmm(1439) == "23:59"
 
-    def test_advance_progresses_time(self):
-        """Each advance adds some minutes."""
-        clock = WorldClock(day=1, minute=1020)
-        start_minute = clock.minute
-        clock.advance()
-        assert clock.minute > start_minute
+    def test_advance_is_lazy_sync_not_progress(self, monkeypatch, tmp_path):
+        """advance() 是"同步到真实时间"，不是"推进时间"。
 
-    def test_advance_publishes_event(self):
-        """Advance publishes TIME_ADVANCE event."""
+        旧契约（narrative clock）：每轮加几分钟，所以 `advance()` 后 minute 变大。
+        新契约（wall clock）：minute 直接读系统时钟。第一次调用只做快照、
+        返回 0、不发事件——这正是它避免每轮都唤醒订阅者的机制。
+        """
+        clock = _clock_at(monkeypatch, _dt.datetime(2026, 9, 12, 17, 0), data_dir=tmp_path)
         bus = EventBus()
         received = []
         bus.subscribe(TIME_ADVANCE, lambda e: received.append(e.data))
 
-        clock = WorldClock(day=1, minute=1020)
+        delta = clock.advance(bus)
+
+        assert delta == 0            # 首次调用只快照
+        assert received == []        # 因此不发事件
+        assert clock.minute == 1020  # 时间没有被"推进"，它就是墙钟
+
+    def test_advance_publishes_on_phase_change(self, monkeypatch, tmp_path):
+        """phase 真的变了，才发 TIME_ADVANCE。"""
+        set_now = _freeze(monkeypatch, _dt.datetime(2026, 9, 12, 15, 0))
+        clock = WorldClock(data_dir=tmp_path)   # 15:00 → 午
+        bus = EventBus()
+        received = []
+        bus.subscribe(TIME_ADVANCE, lambda e: received.append(e.data))
+
+        clock.advance(bus)                      # 首次：快照，不发
+        assert received == []
+
+        set_now(_dt.datetime(2026, 9, 12, 17, 0))   # 午 → 黄昏
         clock.advance(bus)
 
         assert len(received) == 1
-        assert "phase" in received[0]
+        assert received[0]["phase"] == "黄昏"
         assert "delta" in received[0]
 
-    def test_day_rollover(self):
-        """Minute overflow rolls to next day."""
-        clock = WorldClock(day=1, minute=1430)  # 23:50
-        # advance_schedule[0] = 15 → 1445 → day 2, 00:05
-        clock.advance()
-        assert clock.day == 2
-        assert clock.minute == 5  # 1445 - 1440
-        assert clock.phase == "深夜"
+    def test_advance_is_silent_when_nothing_changes(self, monkeypatch, tmp_path):
+        """phase 和 day 都没变时，重复 advance 不该刷事件。
 
-    def test_describe(self):
-        """describe() returns human-readable string."""
-        clock = WorldClock(day=3, minute=1020)
+        （旧 day_rollover 测试测的是"分钟溢出跨天"——墙钟不会溢出，
+          跨天是真实午夜，见下面的 test_day_rollover_on_real_midnight。）
+        """
+        set_now = _freeze(monkeypatch, _dt.datetime(2026, 9, 12, 17, 0))
+        clock = WorldClock(data_dir=tmp_path)
+        bus = EventBus()
+        received = []
+        bus.subscribe(TIME_ADVANCE, lambda e: received.append(e.data))
+
+        clock.advance(bus)                            # 快照
+        set_now(_dt.datetime(2026, 9, 12, 17, 30))    # 同一 phase 内
+        clock.advance(bus)
+        clock.advance(bus)
+
+        assert received == []
+
+    def test_day_rollover_on_real_midnight(self, monkeypatch, tmp_path):
+        """真实午夜跨天：day +1，phase 落回深夜，并标记 day_changed。"""
+        set_now = _freeze(monkeypatch, _dt.datetime(2026, 9, 12, 23, 50))
+        clock = WorldClock(data_dir=tmp_path)
+        assert clock.day == 1
+
+        bus = EventBus()
+        received = []
+        bus.subscribe(TIME_ADVANCE, lambda e: received.append(e.data))
+        clock.advance(bus)                            # 快照（夜）
+
+        set_now(_dt.datetime(2026, 9, 13, 0, 5))      # 午夜之后
+        clock.advance(bus)
+
+        assert clock.day == 2
+        assert clock.minute == 5
+        assert clock.phase == "深夜"
+        assert len(received) == 1
+        assert received[0].get("day_changed") is True
+
+    def test_describe(self, monkeypatch, tmp_path):
+        """describe() 的格式是 `第N天 HH:MM（phase）`。"""
+        import dataclasses
+
+        clock = _clock_at(
+            monkeypatch, _dt.datetime(2026, 9, 14, 17, 0), data_dir=tmp_path,
+        )
+        # 锚点改成 9/12 → 9/14 就是第 3 天（dataclasses.replace 会重跑 __post_init__，
+        # 但 first_interaction.json 已存在且日期是 9/14，所以随后手动覆盖锚点）
+        clock = dataclasses.replace(clock, data_dir=tmp_path)
+        clock._first_date = _dt.date(2026, 9, 12)
+
         desc = clock.describe()
-        assert "3" in desc
+        assert "第3天" in desc
         assert "17:00" in desc
         assert "黄昏" in desc
 
@@ -216,32 +334,39 @@ class TestEventBus:
 class TestTimeSceneIntegration:
     """Integration: clock + scene + bus work together."""
 
-    def test_clock_advance_does_not_change_scene(self):
+    def test_clock_advance_does_not_change_scene(self, monkeypatch, tmp_path):
         """Advancing clock alone doesn't move scene."""
         bus = EventBus()
         scene_events = []
         bus.subscribe(SCENE_TRANSITION, lambda e: scene_events.append(e))
 
-        clock = WorldClock(day=1, minute=1020)
+        clock = WorldClock(data_dir=tmp_path)
+        _freeze(monkeypatch, _dt.datetime(2026, 9, 12, 17, 0))
         scene = SceneState(name="天台", phase="黄昏")
         mgr = SceneManager(scene, bus=bus)
 
         clock.advance(bus)  # should only fire TIME_ADVANCE
         assert len(scene_events) == 0  # no scene transition
 
-    def test_full_flow(self):
+    def test_full_flow(self, monkeypatch, tmp_path):
         """Full flow: advance time, transition scene, all events fire."""
         bus = EventBus()
         events = []
         for etype in [TIME_ADVANCE, SCENE_TRANSITION]:
             bus.subscribe(etype, lambda e: events.append((e.type, e.data)))
 
-        clock = WorldClock(day=1, minute=1020)
-        scene = SceneState(name="天台", phase="黄昏")
+        set_now = _freeze(monkeypatch, _dt.datetime(2026, 9, 12, 15, 0))
+        clock = WorldClock(data_dir=tmp_path)   # 15:00 → 午
+        scene = SceneState(name="天台", phase="午")
         mgr = SceneManager(scene, bus=bus)
 
+        clock.advance(bus)                      # 首次只快照，不发事件
+        set_now(_dt.datetime(2026, 9, 12, 17, 0))   # 午 → 黄昏，这次会发
         clock.advance(bus)
-        mgr.transition("客厅", new_phase="夜")
+        # 场景转移要遵守 SceneManager 的转移表：午 → ["黄昏"]。
+        # 原来这里写的是 new_phase="夜"，午 到 夜 不合法，transition() 会返回 False
+        # 且不发事件——那个断言从一开始就是错的（只是以前构造函数先抛了，没跑到）。
+        assert mgr.transition("客厅", new_phase="黄昏") is True
 
         event_types = [t for t, _ in events]
         assert TIME_ADVANCE in event_types

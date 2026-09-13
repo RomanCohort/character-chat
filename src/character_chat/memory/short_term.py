@@ -21,6 +21,7 @@ class ShortTermMemory:
         scene: Optional[str] = None,
         time_phase: Optional[str] = None,
         importance: MemoryImportance = MemoryImportance.NORMAL,
+        emotional_valence: Optional[float] = None,
     ) -> MemoryEntry:
         """Add a new memory entry. Returns the created entry."""
         entry = MemoryEntry(
@@ -28,6 +29,7 @@ class ShortTermMemory:
             memory_type=MemoryType.SHORT_TERM,
             importance=importance,
             emotion_label=emotion_label,
+            emotional_valence=emotional_valence,
             scene=scene,
             time_phase=time_phase,
         )

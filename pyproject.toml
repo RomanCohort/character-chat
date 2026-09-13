@@ -13,6 +13,16 @@ dependencies = [
     "torch>=2.0",
     "loguru>=0.7",
     "sqlite-vec>=0.1",
+    # 2026-09-13 补齐：代码里在用但之前漏声明
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "numpy>=1.26",
+    "scikit-learn>=1.3",
+    "transformers>=4.40",
+    "ddgs>=6.0",
+    "duckduckgo_search>=6.0",
+    "lunardate>=0.2",
+    "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]

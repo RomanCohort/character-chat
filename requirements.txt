@@ -9,3 +9,15 @@ loguru>=0.7
 sqlite-vec>=0.1
 pytest>=7.4
 pytest-asyncio>=0.21
+
+# --- 2026-09-13 补齐：这些包代码里在用，但之前没声明。
+#     缺了它们 clone 下来装完起不来（server.py / embedding / long_term / web_search 等）---
+fastapi>=0.110
+uvicorn>=0.27
+numpy>=1.26
+scikit-learn>=1.3
+transformers>=4.40
+ddgs>=6.0
+duckduckgo_search>=6.0
+lunardate>=0.2
+zstandard>=0.22

@@ -55,3 +55,10 @@ iGEM_Best_Software_*.txt
 dsh/.credentials.yaml
 *.credentials.yaml
 !*.credentials.example.yaml
+
+# --- 模型权重（2026-09-13 加）---
+# models/bge-small-zh-v1.5 是 96MB 的模型副本，让它离线加载、不碰 HF 网络。
+# 不提交：依据 AGENTS.md「推非代码大文件前必须问」，这类文件进 git 历史后
+# 很难清理（曾为此做过三轮 filter-repo）。
+# 换机器时从 HF 缓存重新落一份即可，embedding.py 会自动优先用它。
+models/

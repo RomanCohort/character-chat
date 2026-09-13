@@ -15,7 +15,10 @@
 - 加载完成后进程内复用，后续 encode 秒级
 - 加载失败标记 _load_failed，不再重试
 """
+import os
 import threading
+from pathlib import Path
+
 import numpy as np
 from typing import List, Optional
 from loguru import logger
@@ -23,6 +26,25 @@ from loguru import logger
 
 # 默认模型：BGE-small-zh-v1.5，512维，中文优化
 DEFAULT_MODEL = "BAAI/bge-small-zh-v1.5"
+
+# 项目内置模型目录。优先用它，而不是 HF 的模型名。
+#
+# 为什么不用模型名（2026-09-13 实测）：
+#   这台机器的 hosts 里 huggingface.co 指向 127.0.0.1，由 Steam++.Accelerator
+#   在 443 上做中间人（它转发的目标是对的，加速本身没问题）。但 huggingface_hub
+#   走 requests/httpx，它们信任 certifi 这个静态 PEM，不认加速器的根证书，于是：
+#     urllib   OK    5.3s   （用 ssl 默认上下文 = Windows 证书库，认）
+#     requests FAIL SSLError
+#     httpx    FAIL SSLError
+#   结果是每次加载都撞 5 轮 SSL 重试（冷启实测 142s），最后静默退化成
+#   "Creating a new one with mean pooling" —— 语义检索质量下降而没人知道。
+#
+# 传本地目录给 SentenceTransformer 就完全不碰网络（实测 15s 就绪）。
+# 可通过 DSH_EMBEDDING_MODEL 覆盖；目录不存在时回落到模型名。
+_LOCAL_MODEL_DIR = os.environ.get(
+    "DSH_EMBEDDING_MODEL_DIR",
+    str(Path(__file__).resolve().parents[3] / "models" / "bge-small-zh-v1.5"),
+)
 
 
 class EmbeddingEncoder:
@@ -70,11 +92,22 @@ class EmbeddingEncoder:
             t = time.time()
             try:
                 from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(self._model_name)
+                # 本地目录优先：完全离线，不走 HF 网络校验。
+                if Path(_LOCAL_MODEL_DIR).is_dir():
+                    load_from = _LOCAL_MODEL_DIR
+                    logger.info(f"[Embedding] 用项目内置模型目录：{load_from}")
+                else:
+                    load_from = self._model_name
+                    logger.warning(
+                        f"[Embedding] 内置模型目录不存在（{_LOCAL_MODEL_DIR}），"
+                        f"回落到模型名 {load_from!r}——这会走网络，"
+                        f"在这台机器上可能撞 SSL 重试并退化成 mean pooling"
+                    )
+                self._model = SentenceTransformer(load_from)
                 self._dim = self._model.get_sentence_embedding_dimension()
                 logger.info(
                     f"[Embedding] loaded {self._model_name} "
-                    f"(dim={self._dim}, {round(time.time()-t,1)}s)"
+                    f"(from={load_from}, dim={self._dim}, {round(time.time()-t,1)}s)"
                 )
             except Exception as e:
                 logger.error(f"[Embedding] load {self._model_name} failed: {e}")

@@ -45,12 +45,22 @@
         configPath: ~/.dsh/hooks.json
 
 # --- remote-web-ui lan-bind block (managed - do not edit) ---
-# 注意：host 0.0.0.0 = 局域网内任何设备都能访问这个 GUI。
-# 方便手机连，但同一网络下别人也能打开——不需要就删掉这段，让它回到 127.0.0.1。
+# 2026-09-13：改回 loopback 绑定。
+#
+# 原来这里是 host: '0.0.0.0'，配合一条 `deepclaw dsh web 3080` 防火墙规则
+# （Profile=Any / RemoteAddr=Any），等于把 GUI 挂在**吉林大学校园网**上。
+# 虽然 DSH 自带 token 认证（无 token 一律 401，实测过），但那一层是"猜不到"
+# 而不是"进不来"，而且校园网是开放 SSID。
+#
+# 实测佐证：~/.dsh/remote-web-ui-devices.json 是 {}，3080 的连接记录全是
+# 127.0.0.1——从来没有外部设备连上过。所以绑定 loopback 没有任何实际损失。
+#
+# 手机远程下命令走微信那条通道（*work），不需要 GUI。
+# 真要恢复局域网访问：把 host 改回 '0.0.0.0' 并重启 dsh web，同时明白上面这段。
 - id: webserver
   name: '@deepseek-ai/dsh-host-webserver'
   config:
-    host: '0.0.0.0'
+    host: '127.0.0.1'
     port: 3080
     compression: gzip
     compressionLevel: 1

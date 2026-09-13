@@ -17,7 +17,7 @@ from typing import Dict, Optional
 from contextlib import asynccontextmanager
 from functools import partial
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from loguru import logger
@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from character_chat.cli import Cli
 from character_chat.config import load_config
 from character_chat.live2d import live2d_websocket, get_status
+from character_chat.wechat import auth
 from character_chat.wechat import bridge as dsh_bridge
 
 
@@ -45,6 +46,20 @@ TASK_WORKDIR = os.environ.get("TASK_WORKDIR", "D:/wechat-character-bridge")
 PROACTIVE_STATE_FILE = os.environ.get(
     "PROACTIVE_STATE_FILE", r"D:\ling-muxue-logs\proactive_state.json"
 )
+
+# --- CORS ---
+# 原来是 `allow_origins=["*"]`，那是个真漏洞：任何网页都能向 127.0.0.1:8000
+# 发跨域 POST /chat，而 /chat 带 *work 就是"在这台机器上执行命令"。
+# 也就是说浏览器开着的时候点进一个恶意页面，等于把机器交出去。
+#
+# 实测过：本仓库/本机所有调用方（wechat-ai-code-bridge、memory_mcp_server.py、
+# scripts/ 下的诊断脚本）全是 node/python 服务端调用，**没有一个浏览器**。
+# 所以默认不发任何跨域许可；确需浏览器直连时用 DSH_CORS_ORIGINS 显式列白名单。
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("DSH_CORS_ORIGINS", "").split(",")
+    if o.strip()
+]
 
 # 任务执行走"请求批准"流程（路线1）：
 # 凌暮雪识别任务 → 输出 <task_request>描述</task_request> + 微信里问你"可以吗"
@@ -373,9 +388,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -583,7 +598,10 @@ def _execute_task(task_text: str) -> str:
 
 @app.get("/", response_model=StatusResponse)
 async def root():
-    """Health check."""
+    """Health check. 不要求登录——otherwise 没法探活。
+
+    注意它只回状态，不泄漏会话内容 / 记忆 / 任何可操作信息。
+    """
     return StatusResponse(
         status="running",
         character=character_name,
@@ -591,9 +609,80 @@ async def root():
     )
 
 
+# --- 认证 ---
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+async def require_auth(request: Request) -> str:
+    """端点守卫：本机免登录，其它来源必须带有效会话 cookie。
+
+    返回身份字符串（`local` 或用户名），只用于日志。
+    """
+    client_host = request.client.host if request.client else None
+    if auth.is_local(request.headers.get("host"), client_host):
+        return "local"
+    user = auth.verify_session(request.cookies.get(auth.COOKIE_NAME, ""))
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="需要登录：POST /auth/login 拿会话 cookie",
+            headers={"WWW-Authenticate": "Cookie"},
+        )
+    return user
+
+
+@app.post("/auth/login")
+async def auth_login(req: LoginRequest, response: Response, request: Request):
+    """账号密码换会话 cookie。"""
+    if not auth.list_users():
+        raise HTTPException(
+            status_code=503,
+            detail="还没有任何账号。在机器上跑：python scripts/dsh_auth.py add <用户名>",
+        )
+    if not auth.check_credentials(req.username, req.password):
+        logger.warning(f"[auth] 登录失败 user={req.username!r} from={request.client.host if request.client else '?'}")
+        raise HTTPException(status_code=401, detail="用户名或密码不对")
+    value = auth.issue_session(req.username.strip())
+    response.set_cookie(
+        auth.COOKIE_NAME,
+        value,
+        max_age=auth.SESSION_DAYS * 86400,
+        httponly=True,
+        samesite="lax",
+        # 局域网是纯 HTTP，设 Secure 会导致 cookie 根本发不出去。
+        secure=False,
+    )
+    logger.info(f"[auth] 登录成功 user={req.username!r}")
+    return {"ok": True, "username": req.username.strip(), "expires_days": auth.SESSION_DAYS}
+
+
+@app.post("/auth/logout")
+async def auth_logout(response: Response):
+    response.delete_cookie(auth.COOKIE_NAME)
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request, _: str = Depends(require_auth)):
+    """当前身份。前端用它判断要不要跳登录页。"""
+    client_host = request.client.host if request.client else None
+    local = auth.is_local(request.headers.get("host"), client_host)
+    return {
+        "local": local,
+        "username": auth.verify_session(request.cookies.get(auth.COOKIE_NAME, "")),
+        "users_exist": bool(auth.list_users()),
+    }
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, _: str = Depends(require_auth)):
     """Main chat endpoint — called by wechat-ai-code-bridge.
+
+    需要认证：本机来源直接放行，其它来源要会话 cookie。见 wechat/auth.py。
 
     Flow:
       1. Call cli.send(text) → get character reply
@@ -793,7 +882,7 @@ class MemSearchReq(BaseModel):
 
 
 @app.post("/memory/store")
-async def memory_store(req: MemStoreReq):
+async def memory_store(req: MemStoreReq, _: str = Depends(require_auth)):
     """存一条记忆到共享库（终端 Claude Code 用）。"""
     cli = cli_instances.get("default")
     if cli is None:
@@ -815,7 +904,7 @@ async def memory_store(req: MemStoreReq):
 
 
 @app.post("/memory/search")
-async def memory_search(req: MemSearchReq):
+async def memory_search(req: MemSearchReq, _: str = Depends(require_auth)):
     """检索共享记忆（带 #17 加权机制）。返回格式化后的记忆串 + 原始分。"""
     cli = cli_instances.get("default")
     if cli is None:
@@ -846,7 +935,7 @@ async def memory_search(req: MemSearchReq):
 
 
 @app.get("/memory/stats")
-async def memory_stats():
+async def memory_stats(_: str = Depends(require_auth)):
     """共享记忆库统计。"""
     cli = cli_instances.get("default")
     if cli is None:
@@ -857,7 +946,7 @@ async def memory_stats():
 
 
 @app.get("/memory/milestone")
-async def memory_milestone(within_days: int = 7):
+async def memory_milestone(within_days: int = 7, _: str = Depends(require_auth)):
     """查未来 N 天内即将到来的纪念日（Phase3 里程碑主动话题）。
 
     daemon topic_sources.get_milestone_topics() 调这个，找"在一起 N 天""相识周年"等。
@@ -868,7 +957,7 @@ async def memory_milestone(within_days: int = 7):
 
 
 @app.post("/memory/seed")
-async def memory_seed_endpoint(force: bool = False):
+async def memory_seed_endpoint(force: bool = False, _: str = Depends(require_auth)):
     """手动触发种子记忆灌入。
 
     默认仅在空库时生效；传 force=true 则强制补灌（用于往已有真实记忆的库回填种子）。
@@ -886,7 +975,7 @@ async def memory_seed_endpoint(force: bool = False):
 
 
 @app.post("/memory/backfill")
-async def memory_backfill():
+async def memory_backfill(_: str = Depends(require_auth)):
     """全量回填 embedding：给所有无向量的存量记忆编码 BGE 向量。
 
     升级到 RAG 后一次性补全旧记忆（41 条存量原本只有 TF-IDF char n-gram）。
@@ -903,7 +992,7 @@ async def memory_backfill():
 
 
 @app.get("/sessions")
-async def list_sessions():
+async def list_sessions(_: str = Depends(require_auth)):
     """List active sessions."""
     return {
         "sessions": list(cli_instances.keys()),
@@ -912,7 +1001,7 @@ async def list_sessions():
 
 
 @app.delete("/session/{session_id}")
-async def clear_session(session_id: str):
+async def clear_session(session_id: str, _: str = Depends(require_auth)):
     """Clear a specific session (reset memory)."""
     if session_id in cli_instances:
         del cli_instances[session_id]

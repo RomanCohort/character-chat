@@ -85,11 +85,37 @@ DSH 每轮提交用户消息
 - 别贴进聊天记录或 issue。
 - 真泄露了：去平台吊销重发，别只删文件——进了 git 历史就删不干净。
 
-## ⚠ 局域网暴露
+## 网络暴露
 
-`profiles/web/cordis.patch.yml` 把 GUI 绑到 `0.0.0.0:3080`，同一网络下**任何设备
-都能打开**，而且当时是 `danger-full-access`。手机连着方便，代价是这个。
-不需要就删掉那段，回到 `127.0.0.1`。
+`profiles/web/cordis.patch.yml` 里 GUI 绑 **`127.0.0.1:3080`（只有本机能连）**。
+
+2026-09-13 之前是 `0.0.0.0`，配合一条 `deepclaw dsh web 3080` 防火墙规则
+（Profile=Any / RemoteAddr=Any），等于把 GUI 挂在开放校园网上。现在：
+配置改回 loopback，那条规则和两条过宽的 `node.exe` 入站规则都已删除。
+
+DSH 自带 token 认证（无 token 一律 401，实测过），更早的文档里写的"未受保护"
+指的是 webserver 层不做认证——认证由 `dsh-client-connection` 那一层负责。
+但"猜不到 token"和"连不上"是两件事，开放网络上不该只靠前者。
+
+**手机远程下命令走微信那条通道（`*work`），不需要 GUI。**
+
+要恢复局域网访问：把 `host` 改回 `'0.0.0.0'` 并重启 `dsh web`，同时明白上面这段。
+
+## 8000 服务的账号密码
+
+`character_chat` 的 8000 服务有自己的登录（`src/character_chat/wechat/auth.py`）：
+
+- **本机 loopback 免登录**——微信桥在同一台机器上，走 loopback 调 `/chat`
+- **其它来源必须登录**：`POST /auth/login` 换签名会话 cookie
+- 加人：`python scripts/dsh_auth.py add <用户名>`
+- 紧急踢人：`python scripts/dsh_auth.py kick`
+
+凭据落在 `data/auth_users.json` 和 `data/auth_secret.key`，都在 `.gitignore` 里。
+密码是 PBKDF2-HMAC-SHA256（20 万次迭代 + 每人独立 salt）。
+
+那个服务的 CORS 原来是 `allow_origins=["*"]`，配合一个只查前缀、不查来源的
+`/chat`，等于**任何网页都能跨域触发 `*work` 在这台机器上执行命令**。
+现在默认不发任何跨域许可（`DSH_CORS_ORIGINS` 可显式加白名单）。
 
 ## 微信通道
 

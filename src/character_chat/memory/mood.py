@@ -59,6 +59,10 @@ class MoodState:
     petty_since: float = 0.0       # 触发时间戳
     petty_duration_hours: float = 3.0  # 默认持续 3 小时（2-6 小时范围）
     petty_trigger: str = ""        # 触发原因描述（方便调试和 prompt 注入）
+    # 第 ① 步（搬 CLF 温度控制器）：上一轮实际用的采样温度。
+    # 落盘是为了**可观测** —— cli.py 的 handler 只放 WARNING 以上，
+    # INFO 日志在生产里看不见，写进 mood_state.json 才查得到。
+    last_sampling_temp: float = 0.0
 
 
 @dataclass
@@ -618,6 +622,44 @@ class MoodSystem:
     # =========================================================================
     # 查询接口
     # =========================================================================
+    def get_sampling_temperature(self, base: float, max_delta: float = 0.12) -> float:
+        """CLF 的 TemperatureController 接到 LLM 采样上（第 ① 步）。
+
+        CLF 原版 core/personality/neuromodulation.py 的规则：
+            dopamine_effect  = base * (1.2 - dopamine)         # 多巴胺↑ → 温度↓（自信）
+            serotonin_effect = base * (0.8 + serotonin * 0.8)  # 血清素↑ → 温度↑（保守）
+            general → 两者取平均
+        把 VAD 映到那两个调质上：
+            dopamine  = 效价 + 支配     （心情好、有掌控 → 自信 → 温度低）
+            serotonin = 唤醒            （激动/不安 → 更发散 → 温度高）
+        行为核对：被撩（低支配 + 高唤醒）→ 温度升高、回复更抖；
+        心动/心软（高效价 + 平静）→ 温度降低、回复更收敛。
+
+        注意：CLF 那几个常数（base=1.0、区间 0.3-2.0）是给 softmax logits 用的，
+        LLM 采样器的合适区间窄得多，所以这里只沿用**规则**，常数按 LLM 重标定：
+        常态心境（valence=0, arousal=0.3, dominance=0.5）算出 factor=1.0，
+        偏离最多 ±max_delta。别把这条写成"复现了 CLF 的温度控制器"。
+
+        max_delta 本来给的是 0.25，实测压到 0.12：她跑几轮之后心境常落到
+        valence≈-0.68 / dominance≈0.25（mood.py 的关键词兜底表里 "报错"->anxious
+        等会推它），多巴胺触底，于是这条通道长期停在 96% 行程上 —— 既没有余量，
+        又把第 2 步的语域偏置（±15%）整个盖掉。压到 0.12 之后两条通道才各有话语权。
+        """
+        def _c01(x):
+            return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+        s = self.state
+        dopamine = _c01(0.5 + 0.6 * s.valence + 0.4 * (s.dominance - 0.5))
+        serotonin = _c01(0.5 + 0.8 * (s.arousal - 0.3))
+        raw = ((1.2 - dopamine) + (0.8 + serotonin * 0.8)) / 2.0   # 常态 → 0.95
+        factor = 1.0 + (raw - 0.95) / 0.45 * max_delta
+        temp = round(max(0.05, base * factor), 3)
+        try:
+            self.state.last_sampling_temp = temp
+        except Exception:
+            pass
+        return temp
+
     def get_prompt_snippet(self) -> str:
         """生成注入 system prompt 的心境描述片段
 
@@ -651,6 +693,31 @@ class MoodSystem:
                     "再关心/回应（语气软下来），可带耳根红或嘴角压不住的侧写。"
                     "不是真拒绝，是害羞的反向表达。"
                 )
+        except Exception:
+            pass
+
+        # ── 本地补丁（2026-10-09）(b) 让心境**可叙述** ────────────────────
+        # 原来只注入"当前是什么心情"，不注入"为什么"。她知道自己低落，
+        # 但说不出因此由 —— 于是只能笼统地丧，不能具体。
+        # trajectory 里本来就存了 {ts, topic, emotion, valence}（聊什么的时候什么心情），
+        # 建了却从没被读过。取最近两条，折算成"刚刚/几分钟前"喂进去。
+        try:
+            traj = list(s.trajectory or [])[-2:]
+            bits = []
+            for e in traj:
+                topic = (e.get("topic") or "").strip().replace("\n", " ")
+                if not topic:
+                    continue
+                age_min = max(0, int((time.time() - float(e.get("ts") or time.time())) / 60))
+                if age_min < 10:
+                    when = "刚刚"
+                elif age_min < 90:
+                    when = "%d 分钟前" % age_min
+                else:
+                    when = "%d 小时前" % (age_min // 60)
+                bits.append("%s聊到「%s」" % (when, topic[:34]))
+            if bits:
+                state_desc = "%s。来由：%s" % (state_desc, "；".join(bits))
         except Exception:
             pass
 

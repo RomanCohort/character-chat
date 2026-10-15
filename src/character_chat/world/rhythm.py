@@ -158,23 +158,59 @@ def build_dynamic_rhythm(phase: str, dt: Optional[datetime] = None) -> dict:
     return r
 
 
-def rhythm_prompt(phase: str, dt: Optional[datetime] = None) -> str:
+def rhythm_prompt(phase: str, dt: Optional[datetime] = None, world=None) -> str:
     """把节律内容包格式化成 system_prompt 注入片段。
 
-    给凌暮雪一个"此时此刻她在干嘛、什么状态"的锚点，让回复有时段感。
+    给角色一个"此时此刻大概在干嘛、什么状态"的锚点，让回复有时段感。
     不是硬性指令，是氛围提示。
+
+    world=None（默认）走**内置那套**——上面 RHYTHM / build_dynamic_rhythm 里
+    写死的内容是按凌暮雪写的，所以这条路只给她用，一个字都不改。
+    world={} 或给了内容 → 走**按角色卡驱动**：内容全部取自卡里的 world 段，
+    卡里没写就不编（只留一句中性的时段提示）。
     """
-    r = build_dynamic_rhythm(phase, dt)
-    # 周末/饭点/熬夜 标记，让 LLM 明确今天是周几
     if dt is None:
         dt = datetime.now()
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][dt.weekday()]
     weekend_tag = "（周末·摸鱼基调）" if is_weekend(dt) else "（工作日）"
 
-    return (
-        f"【当前时段：{phase}】{weekday_cn}{weekend_tag}\n"
-        f"此时她大概在：{r['activity']}。\n"
-        f"语气基调：{r['tone']}。\n"
-        f"颜情绪倾向：{r['kaomoji_mood']}。\n"
-        f"可能的话茬：{r['topics']}。"
-    )
+    if world is None:
+        r = build_dynamic_rhythm(phase, dt)
+        return (
+            f"【当前时段：{phase}】{weekday_cn}{weekend_tag}\n"
+            f"此时她大概在：{r['activity']}。\n"
+            f"语气基调：{r['tone']}。\n"
+            f"颜情绪倾向：{r['kaomoji_mood']}。\n"
+            f"可能的话茬：{r['topics']}。"
+        )
+
+    # ── 按卡驱动：内容只从卡里取 ────────────────────────────────
+    ph = ((world or {}).get("phases") or {}).get(phase) or {}
+    pron = str((world or {}).get("pronoun") or "").strip()
+    activity = ph.get("activity")
+    if is_weekend(dt):
+        wk = ((world or {}).get("weekend") or {}).get(phase)
+        if wk:
+            activity = wk
+    meal = _current_meal(dt.hour, dt.minute)
+    meals = (world or {}).get("meals") or {}
+    if meal and meal[0] in meals:
+        activity = meals[meal[0]]
+    sleep_state = _sleep_state(dt.hour)
+    if sleep_state is not None:
+        sl = (world or {}).get("sleep") or {}
+        activity = sl.get("owl" if dt.hour >= NIGHT_OWL_THRESHOLD else "drowsy",
+                          sleep_state)
+
+    lines = [f"【当前时段：{phase}】{weekday_cn}{weekend_tag}"]
+    if activity:
+        lines.append("此时%s大概在：%s。" % (pron, activity))
+    if ph.get("tone"):
+        lines.append("语气基调：%s。" % ph["tone"])
+    if ph.get("kaomoji_mood"):
+        lines.append("颜情绪倾向：%s。" % ph["kaomoji_mood"])
+    if ph.get("topics"):
+        lines.append("可能的话茬：%s。" % ph["topics"])
+    if len(lines) == 1:
+        lines.append("这个时段的具体状态按你自己的人设来，别编造过去的事。")
+    return "\n".join(lines)

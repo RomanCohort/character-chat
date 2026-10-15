@@ -11,6 +11,14 @@ class LLMConfig:
     model_id: str = "deepseek-chat"
     base_url: str = "https://api.deepseek.com/v1"
     temperature: float = 0.7
+    # 本地 Qwen 补丁：主端点连不上/超时就落到 fallback_*；留空 = 维持原行为
+    timeout: float = 60.0
+    # 本地 Qwen 补丁：一次调用最多生成多少 token。
+    # 不设的话 RP 模型复读时会无限生成，把唯一槽位占死（真发生过）。
+    max_tokens: int = 900
+    fallback_api_key: str = ""
+    fallback_base_url: str = ""
+    fallback_model_id: str = ""
 
 
 class LLMClient:
@@ -18,17 +26,79 @@ class LLMClient:
 
     def __init__(self, config: LLMConfig):
         self.config = config
-        self.client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        self.client = OpenAI(api_key=config.api_key, base_url=config.base_url,
+                              timeout=config.timeout)
         self.model_id = config.model_id
+        # 本地 Qwen 补丁：可选兜底端点
+        self.last_backend = "primary"
+        self._fb_client = None
+        self._fb_model = ""
+        if config.fallback_base_url:
+            self._fb_client = OpenAI(api_key=config.fallback_api_key or "unused",
+                                     base_url=config.fallback_base_url,
+                                     timeout=config.timeout)
+            self._fb_model = config.fallback_model_id or config.model_id
+            logger.info("[llm] 主端点 %s / 兜底 %s"
+                        % (config.base_url, config.fallback_base_url))
+
+    @staticmethod
+    def _is_empty(resp) -> bool:
+        """主端点是否返回了"空内容"。
+
+        思维链模型（Qwen3.6-35B-A3B 等）在推理预算被吃光时，
+        会用 HTTP 200 返回 content="" —— 这在语义上是失败，必须走兜底。
+        但带 tool_calls 的响应即使 content 为空也是有效输出。
+        """
+        try:
+            msg = resp.choices[0].message
+        except Exception:
+            return True
+        if getattr(msg, "tool_calls", None):
+            return False
+        return not (getattr(msg, "content", None) or "").strip()
+
+    def _create(self, **kwargs):
+        """主端点优先；任何异常落到兜底端点。返回原始 OpenAI response。"""
+        try:
+            self.last_backend = "primary"
+            kw_primary = dict(kwargs)
+            # 本地优先客户端（配了兜底端点）→ 主端点就是本机 Qwen。
+            # 显式关掉思维链：网关是 setdefault，客户端传的优先。
+            # 人设对话那个客户端没有 fallback，不受影响。
+            if self._fb_client is not None:
+                eb = dict(kw_primary.get("extra_body") or {})
+                ctk = dict(eb.get("chat_template_kwargs") or {})
+                ctk.setdefault("enable_thinking", False)
+                eb["chat_template_kwargs"] = ctk
+                kw_primary["extra_body"] = eb
+            _resp = self.client.chat.completions.create(**kw_primary)
+            if self._is_empty(_resp):
+                raise RuntimeError("主端点返回空内容（多为思维链吃光 max_tokens）")
+            return _resp
+        except Exception as e:
+            if self._fb_client is None:
+                raise
+            logger.warning("[llm] 主端点失败（%s: %s），改走兜底 %s"
+                           % (type(e).__name__, e, self.config.fallback_base_url))
+            self.last_backend = "fallback"
+            kw = dict(kwargs)
+            kw["model"] = self._fb_model
+            # 兜底端点（DeepSeek）不认 chat_template_kwargs，但**必须**关掉思维链：
+            # deepseek-flash 会把整个 max_tokens 预算烧在 reasoning 上，返回半截
+            # JSON —— 表现为"模型（A 段）没给出合法 JSON"。主端点用
+            # chat_template_kwargs 关，兜底用 DeepSeek 自己的 thinking 字段关。
+            kw["extra_body"] = {"thinking": {"type": "disabled"}}
+            return self._fb_client.chat.completions.create(**kw)
 
     def chat(self, messages: list[dict], temperature: Optional[float] = None) -> str:
         """Send messages to LLM and return response (no tools)."""
         temp = temperature if temperature is not None else self.config.temperature
         clean_messages = self._sanitize_messages(messages)
-        response = self.client.chat.completions.create(
+        response = self._create(
             model=self.model_id,
             messages=clean_messages,
             temperature=temp,
+            max_tokens=self.config.max_tokens,
             stream=False
         )
         return response.choices[0].message.content
@@ -66,14 +136,28 @@ class LLMClient:
         clean_messages = self._sanitize_messages(messages)
 
         for _ in range(max_tool_rounds + 1):
-            response = self.client.chat.completions.create(
+            response = self._create(
                 model=self.model_id,
                 messages=clean_messages,
                 tools=tools,
                 temperature=temp,
+                max_tokens=self.config.max_tokens,
                 stream=False,
             )
             msg = response.choices[0].message
+            try:
+                import json as _j, pathlib as _pp
+                _pp.Path("/tmp/tool_debug.json").write_text(_j.dumps({
+                    "finish_reason": response.choices[0].finish_reason,
+                    "msg_keys": list(msg.model_dump().keys()),
+                    "tool_calls": str(getattr(msg, "tool_calls", None))[:400],
+                    "content_head": (msg.content or "")[:400],
+                    "n_tools": len(tools),
+                    "system_len": len(clean_messages[0].get("content", "")),
+                    "n_messages": len(clean_messages),
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
             # 没有 tool_calls → 终态，直接返回 content
             if not msg.tool_calls:
@@ -122,12 +206,27 @@ class LLMClient:
                 })
             # 还有轮次 → 再调一次 LLM，它会基于工具结果生成回复或继续调工具
 
-        # 超 max_tool_rounds：不带 tools 兜底收尾，强制出文本回复
+        # 超 max_tool_rounds：不带 tools 兜底收尾，强制出文本回复。
+        #
+        # 坑（实测踩过）：此刻 clean_messages 结尾是一条 tool 角色消息，而这次调用
+        # **不带 tools**。模型于是顺着工具调用的格式继续写，把
+        # `<｜｜DSML｜｜ invoke name="read_file">` 这类**标记当正文**吐出来，
+        # 原样漏给用户。所以收尾前先塞一条明确的指令把它掰回自然语言。
         logger.warning(f"[tool] 超 max_tool_rounds({max_tool_rounds})，强制收尾")
-        response = self.client.chat.completions.create(
+        clean_messages.append({
+            "role": "user",
+            "content": (
+                "[系统] 工具调用轮次已用尽，不能再调工具了。"
+                "**不要再输出任何工具调用、标签或特殊标记**（不要出现 invoke / parameter "
+                "/ DSML 之类的字样），直接用自然语言把已经查到的内容整理成回答。"
+                "没查到的就直接说没查到。"
+            ),
+        })
+        response = self._create(
             model=self.model_id,
             messages=clean_messages,
             temperature=temp,
+            max_tokens=self.config.max_tokens,
             stream=False,
         )
         return response.choices[0].message.content or ""

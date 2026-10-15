@@ -47,6 +47,83 @@ _LOCAL_MODEL_DIR = os.environ.get(
 )
 
 
+class _OnnxBgeModel:
+    """sentence-transformers 的最小替身 —— 只实现 encode() / get_sentence_embedding_dimension()。
+
+    本地补丁（2026-10-09）：为什么要它
+    --------------------------------
+    这台服务器只有 896MB 内存。torch 一步就吃 ~230MB（当初把 torch 裁掉就是为了
+    把 character_chat 从 438MB 压到 186MB），所以 sentence_transformers 装不上。
+    但 `onnxruntime + tokenizers` 跑**同一个** BGE 模型只要 ~47MB（实测），
+    于是 RAG 从"TF-IDF 字面匹配"回到真向量。
+
+    为什么是替身而不是改 encode()：encode() 只用到 `.encode(...)` 和
+    `.get_sentence_embedding_dimension()` 两个方法。做成同形状的对象，
+    调用方一行都不用动。
+
+    BGE 的正确用法：取 **CLS 位置**（last_hidden_state[:, 0]）+ L2 归一化。
+    """
+
+    def __init__(self, onnx_path: str, tok_path: str, dim: int = 512, max_len: int = 512):
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 2      # 小机器，别把 CPU 铺满
+        so.inter_op_num_threads = 1
+        # 本地补丁（2026-10-09）：必须关掉内存 arena。
+        # 默认 ORT 会把每次推理的临时分配缓存在 arena 里不还，实测连续编码 60 多条
+        # 就把 chat 进程从 266MB 顶到 416MB，服务器只剩 114MB 可用。
+        # 关掉之后每次 run 结束就释放（代价是一点点重复分配，不值得省）。
+        so.enable_cpu_mem_arena = False
+        so.enable_mem_pattern = False
+        self._sess = ort.InferenceSession(
+            onnx_path, sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        self._tok = Tokenizer.from_file(tok_path)
+        self._tok.enable_truncation(max_length=max_len)
+        self._tok.enable_padding()       # 批内对齐长度，单条也不会出错
+        self._dim = dim
+        self._out_names = [o.name for o in self._sess.get_outputs()]
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self._dim
+
+    # 本地补丁（2026-10-09）：内部子批上限。
+    # 为什么必须自己切：调用方（backfill_all）一次给 64 条、每条约 2000 字，
+    # padding 到 512 token 后，64x512 的注意力中间张量直接把进程 OOM 掉
+    # （实测 3 秒被 Killed）。把限制放在编码器里，**任何调用方都不可能撑爆它**，
+    # 比要求每个调用方自己注意批大小可靠。
+    _MAX_SUBBATCH = 8
+
+    def _encode_one_batch(self, texts):
+        encs = self._tok.encode_batch([str(t) for t in texts])
+        ids = np.array([e.ids for e in encs], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+        ttype = np.zeros_like(ids)
+        out = self._sess.run(None, {
+            "input_ids": ids,
+            "attention_mask": mask,
+            "token_type_ids": ttype,
+        })[0]
+        return out[:, 0].astype(np.float32)          # BGE: CLS pooling
+
+    def encode(self, texts, normalize_embeddings: bool = True,
+               show_progress_bar: bool = False, **kwargs):
+        if isinstance(texts, str):
+            texts = [texts]
+        texts = [str(t) for t in texts]
+        chunks = []
+        n_sub = self._MAX_SUBBATCH
+        for i in range(0, len(texts), n_sub):
+            chunks.append(self._encode_one_batch(texts[i:i + n_sub]))
+        vecs = np.vstack(chunks) if len(chunks) > 1 else chunks[0]
+        if normalize_embeddings:
+            norm = np.linalg.norm(vecs, axis=1, keepdims=True)
+            vecs = vecs / np.maximum(norm, 1e-12)
+        return vecs
+
+
 class EmbeddingEncoder:
     """单例式 embedding 编码器（懒加载，进程内复用）。"""
 
@@ -91,6 +168,20 @@ class EmbeddingEncoder:
             import time
             t = time.time()
             try:
+                # ── 本地补丁（2026-10-09）：优先 ONNX 后端 ──────────────────
+                # 这台机器装不了 torch（896MB 内存），所以先用不等 torch 的路。
+                # 两个文件都在就绪 → 直接返回，不再往下走 sentence_transformers。
+                _onnx = Path(_LOCAL_MODEL_DIR) / "onnx" / "model_quantized.onnx"
+                _tokj = Path(_LOCAL_MODEL_DIR) / "tokenizer.json"
+                if _onnx.is_file() and _tokj.is_file():
+                    self._model = _OnnxBgeModel(str(_onnx), str(_tokj))
+                    self._dim = self._model.get_sentence_embedding_dimension()
+                    logger.info(
+                        "[Embedding] ONNX 后端就绪 (model_quantized.onnx, dim=%d, %.1fs)"
+                        % (self._dim, time.time() - t)
+                    )
+                    return
+
                 from sentence_transformers import SentenceTransformer
                 # 本地目录优先：完全离线，不走 HF 网络校验。
                 if Path(_LOCAL_MODEL_DIR).is_dir():

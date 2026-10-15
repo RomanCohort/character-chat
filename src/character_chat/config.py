@@ -1,5 +1,6 @@
 """Application config loader."""
 import os
+from typing import Optional
 from pathlib import Path
 from dataclasses import dataclass
 from ruamel.yaml import YAML
@@ -12,6 +13,7 @@ class AppConfig:
     characters_dir: str
     data_dir: str
     project_root: str
+    local_llm: Optional[LLMConfig] = None   # 本地 Qwen 补丁：本地优先那条路
 
     def resolve_path(self, *parts: str) -> str:
         """Resolve a path relative to project root."""
@@ -39,10 +41,27 @@ def load_config(config_path: str = "config/config.yaml") -> AppConfig:
         base_url=llm_data.get("base_url", "https://api.deepseek.com/v1"),
         temperature=llm_data.get("temperature", 0.7),
     )
+
+    # 本地 Qwen 补丁：可选"本地优先"，兜底指回上面的 llm
+    local_llm = None
+    local_data = data.get("local_llm")
+    if local_data:
+        fb = local_data.get("fallback") or {}
+        local_llm = LLMConfig(
+            api_key=local_data.get("api_key", ""),
+            model_id=local_data.get("model_id", "local"),
+            base_url=local_data.get("base_url", ""),
+            temperature=local_data.get("temperature", 0.7),
+            timeout=float(local_data.get("timeout", 25)),
+            fallback_api_key=fb.get("api_key", llm.api_key),
+            fallback_base_url=fb.get("base_url", llm.base_url),
+            fallback_model_id=fb.get("model_id", llm.model_id),
+        )
     project_root = os.getcwd()
     return AppConfig(
         llm=llm,
         characters_dir=data.get("characters_dir", "config/characters"),
         data_dir=data.get("data_dir", "data"),
         project_root=project_root,
+        local_llm=local_llm,
     )

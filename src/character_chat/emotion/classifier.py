@@ -3,9 +3,13 @@
 Uses HuggingFace transformers pipeline with emotional_distilroberta model.
 Returns 5-label emotion classification: joy, sadness, anger, fear, neutral.
 """
-from typing import Dict, Optional
-import torch
-from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+from typing import Any, Dict, Optional, TYPE_CHECKING
+
+# 惰性化: torch + transformers 约 230MB 常驻内存, 云端 896MB 机器放不下。
+# 只有真正要加载模型时 (NeuralEmotionClassifier._ensure_loaded) 才 import。
+if TYPE_CHECKING:
+    import torch
+    from transformers import pipeline
 
 
 class NeuralEmotionResult:
@@ -55,12 +59,16 @@ class NeuralEmotionClassifier:
 
     def __init__(self, model_name: str | None = None):
         self._model_name = model_name or self._MODEL_NAME
-        self._pipeline: Optional[pipeline] = None
-        self._device = 0 if torch.cuda.is_available() else -1
+        self._pipeline: Optional[Any] = None
+        self._device: Optional[int] = None  # 延迟到真正加载时确定
 
     def _ensure_loaded(self):
         """Ensure model pipeline is loaded (lazy)."""
         if self._pipeline is None:
+            import torch  # 惰性: 到这一刻才真正把 torch 拉进内存
+            from transformers import pipeline
+            if self._device is None:
+                self._device = 0 if torch.cuda.is_available() else -1
             self._pipeline = pipeline(
                 "text-classification",
                 model=self._model_name,

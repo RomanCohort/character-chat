@@ -62,3 +62,10 @@ dsh/.credentials.yaml
 # 很难清理（曾为此做过三轮 filter-repo）。
 # 换机器时从 HF 缓存重新落一份即可，embedding.py 会自动优先用它。
 models/
+
+# --- 服务器部署版合并时补的（2026-10-15）---
+venv/
+*.bak-*
+*.pyc
+__pycache__/
+

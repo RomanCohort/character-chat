@@ -8,12 +8,16 @@ Layers:
   3. Reconciliation (EmotionReconciler)
   4. Tag selection (ExpressionTagSelector)
 """
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from .tracker import EmotionTracker
-from .classifier import NeuralEmotionClassifier, NeuralEmotionResult
 from .reconciler import EmotionReconciler, ReconciledEmotion
 from .tags import ExpressionTagSelector
 from .state import EmotionLabel
+
+# 惰性化: classifier 顶层 import torch + transformers (~230MB 常驻内存)。
+# 云端 896MB 机器放不下, 所以只在真正需要时才 import。
+if TYPE_CHECKING:
+    from .classifier import NeuralEmotionClassifier, NeuralEmotionResult
 
 
 class EmotionPipeline:
@@ -21,7 +25,7 @@ class EmotionPipeline:
 
     def __init__(
         self,
-        classifier: Optional[NeuralEmotionClassifier] = None,
+        classifier: Optional["NeuralEmotionClassifier"] = None,
         expression_tags: Optional[dict] = None,
         neural_enabled: bool = True,
     ):
@@ -40,6 +44,7 @@ class EmotionPipeline:
             self.tag_selector.load_character_tags(expression_tags)
         self.neural_enabled = neural_enabled
         if neural_enabled and classifier is None:
+            from .classifier import NeuralEmotionClassifier  # 惰性: 真要用才拉 torch
             self.classifier = NeuralEmotionClassifier()
 
     def load_character_tags(self, expression_tags: dict):

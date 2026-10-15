@@ -382,8 +382,40 @@ def get_environment_state(dt=None) -> Dict:
     }
 
 
-def get_environment_snippet(dt: date = None) -> str:
-    """生成环境描述，用于注入 system prompt（带真实温度）。"""
+_WORRY_CACHE: Dict = {}
+
+
+def _pick_worry(world, dt_date):
+    """从卡里的 world.worries 按 weight 抽一条，按日期缓存。
+
+    缓存是为了让 get_environment_snippet 与 get_mood_modifiers 抽到**同一条** ——
+    两次独立抽签会出现"提示词里写着 A、心境却按 B 在动"。
+    """
+    ws = ((world or {}).get("worries") or [])
+    if not ws:
+        return None
+    if dt_date not in _WORRY_CACHE:
+        total = sum(float(w.get("weight", 1) or 1) for w in ws) or 1.0
+        x = random.uniform(0.0, total)
+        acc = 0.0
+        pick = ws[-1]
+        for w in ws:
+            acc += float(w.get("weight", 1) or 1)
+            if x <= acc:
+                pick = w
+                break
+        _WORRY_CACHE[dt_date] = pick
+    return _WORRY_CACHE[dt_date]
+
+
+def get_environment_snippet(dt: date = None, world=None) -> str:
+    """生成环境描述，用于注入 system prompt（带真实温度）。
+
+    world=None（默认）走内置那套——RANDOM_EVENTS 里那张烦心事表是按凌暮雪
+    写的，这条路只给她用。
+    world={} 或给了内容 → 天气/节日照旧（这两样是通用的），烦恼事改成
+    从卡里的 world.worries 抽；卡里没写就不出这一段。
+    """
     state = get_environment_state(dt)
 
     parts = []
@@ -399,25 +431,43 @@ def get_environment_snippet(dt: date = None) -> str:
     # 节日
     if state["holiday"]:
         parts.append(f"【今天是{state['holiday']['name']}：{state['holiday']['description']}】")
-        parts.append(f"【今天是{state['holiday']['name']}：{state['holiday']['description']}】")
 
-    # 随机事件
-    if state["random_event"]:
-        event = state["random_event"]
-        category_label = {
-            "positive": "开心",
-            "negative": "烦心",
-            "neutral": "日常",
-        }.get(event["category"], "")
-        parts.append(f"【{category_label}的事：{event['name']}】")
+    if world is None:
+        # 随机事件（内置：凌暮雪那张表）
+        if state["random_event"]:
+            event = state["random_event"]
+            category_label = {
+                "positive": "开心",
+                "negative": "烦心",
+                "neutral": "日常",
+            }.get(event["category"], "")
+            parts.append(f"【{category_label}的事：{event['name']}】")
+    else:
+        w = _pick_worry(world, state["date"])
+        if w:
+            label = {"positive": "开心", "neutral": "日常"}.get(
+                w.get("category"), "烦心")
+            parts.append(f"【{label}的事：{w['name']}】")
 
     return "\n".join(parts)
 
 
-def get_mood_modifiers(dt: date = None) -> Tuple[float, float]:
-    """返回 (mood_modifier, passion_modifier)"""
+def get_mood_modifiers(dt: date = None, world=None) -> Tuple[float, float]:
+    """返回 (mood_modifier, passion_modifier)。
+
+    world 不为 None 时：把内置随机事件那条心情修正扣掉，换成卡里抽到的那条
+    （不然访客的心境会因为"凌暮雪的烦心事"在动，而提示词里根本没写）。
+    """
     state = get_environment_state(dt)
-    return state["mood_modifier"], state["passion_modifier"]
+    mood = state["mood_modifier"]
+    if world is not None:
+        ev = state["random_event"]
+        if ev:
+            mood -= float(ev.get("mood_modifier") or 0.0)
+        w = _pick_worry(world, state["date"])
+        if w:
+            mood += float(w.get("mood_modifier") or 0.0)
+    return mood, state["passion_modifier"]
 
 
 # ==================== 测试 ====================
